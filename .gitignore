@@ -61,3 +61,5 @@ build/
 # =========================
 .DS_Store
 Thumbs.db
+/backend/data/raw/
+/backend/data/processed/
