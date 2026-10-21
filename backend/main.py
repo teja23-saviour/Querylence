@@ -4,6 +4,8 @@ from functools import lru_cache
 from fastapi import FastAPI, HTTPException
 
 from retrieval.bm25_engine import BM25SearchEngine
+from retrieval.semantic_engine import SemanticSearchEngine
+from retrieval.hybrid_engine import HybridSearchEngine
 from schemas.search import SearchRequest
 
 
@@ -13,29 +15,27 @@ app = FastAPI(
         "An intent-aware, self-correcting multimodal "
         "e-commerce retrieval engine."
     ),
-    version="0.1.0",
+    version="0.2.0",
 )
 
 
-# --------------------------------------------------
-# Search engine initialization
-# --------------------------------------------------
-
 @lru_cache(maxsize=1)
-def get_search_engine() -> BM25SearchEngine:
-    """Load and cache the BM25 search engine."""
-    return BM25SearchEngine()
+def get_search_engine() -> HybridSearchEngine:
+    """Initialize and cache both retrieval engines and their fusion."""
+    bm25_engine = BM25SearchEngine()
+    semantic_engine = SemanticSearchEngine()
 
+    return HybridSearchEngine(
+        bm25_engine=bm25_engine,
+        semantic_engine=semantic_engine,
+    )
 
-# --------------------------------------------------
-# Basic endpoints
-# --------------------------------------------------
 
 @app.get("/")
 def root():
     return {
         "message": "Querylence API is running",
-        "version": "0.1.0",
+        "version": "0.2.0",
     }
 
 
@@ -47,15 +47,10 @@ def health():
     }
 
 
-# --------------------------------------------------
-# Text search endpoint
-# --------------------------------------------------
-
 @app.post("/search/text")
 def search_text(request: SearchRequest):
-    """Search the product catalog using BM25."""
+    """Search the product catalog using hybrid retrieval."""
 
-    # The current catalog does not provide reliable prices.
     if (
         request.filters.min_price is not None
         or request.filters.max_price is not None
@@ -72,9 +67,7 @@ def search_text(request: SearchRequest):
     try:
         engine = get_search_engine()
 
-        filters = request.filters.model_dump(
-            exclude_none=True
-        )
+        filters = request.filters.model_dump(exclude_none=True)
 
         results = engine.search(
             query=request.query,
@@ -84,7 +77,7 @@ def search_text(request: SearchRequest):
 
         return {
             "query": request.query,
-            "retrieval_method": "bm25",
+            "retrieval_method": "hybrid",
             "result_count": len(results),
             "results": results,
         }
@@ -99,7 +92,6 @@ def search_text(request: SearchRequest):
         ) from error
 
     except Exception as error:
-        # Log the underlying exception in the server terminal.
         print(f"Querylence search error: {error!r}")
 
         raise HTTPException(
