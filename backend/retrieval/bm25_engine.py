@@ -1,17 +1,21 @@
+
+import heapq
 import json
+import pickle
 import re
 from pathlib import Path
 
 from rank_bm25 import BM25Okapi
 
 
-# Resolve the dataset path relative to this Python file.
 DATASET_PATH = (
     Path(__file__).resolve().parents[1]
     / "data"
     / "processed"
     / "products.jsonl"
 )
+
+CACHE_VERSION = 1
 
 
 def tokenize(text: str) -> list[str]:
@@ -20,19 +24,82 @@ def tokenize(text: str) -> list[str]:
 
 
 class BM25SearchEngine:
-    """Lexical product retrieval using the BM25 ranking algorithm."""
+    """Lexical product retrieval with a persistent BM25 index."""
 
-    def __init__(self, dataset_path: Path = DATASET_PATH):
-        if not dataset_path.exists():
+    def __init__(
+        self,
+        dataset_path: Path = DATASET_PATH,
+        cache_path: Path | None = None,
+    ):
+        self.dataset_path = Path(dataset_path)
+
+        if not self.dataset_path.exists():
             raise FileNotFoundError(
-                f"Product catalog not found: {dataset_path}. "
+                f"Product catalog not found: {self.dataset_path}. "
                 "Run scripts/prepare_abo.py first."
             )
 
-        self.products: list[dict] = []
+        self.cache_path = (
+            Path(cache_path)
+            if cache_path is not None
+            else self.dataset_path.with_name("bm25_index.pkl")
+        )
 
-        # Load products from the JSONL dataset.
-        with dataset_path.open("r", encoding="utf-8") as file:
+        self.dataset_signature = self._get_dataset_signature()
+
+        if self._load_cache():
+            print(
+                f"Loaded cached BM25 index: "
+                f"{len(self.products):,} products."
+            )
+        else:
+            self._build_index()
+            self._save_cache()
+            print(
+                f"Built BM25 index: {len(self.products):,} products, "
+                f"{len(self.vocabulary):,} unique tokens."
+            )
+
+    def _get_dataset_signature(self) -> dict:
+        """Detect whether the source catalog has changed."""
+        stat = self.dataset_path.stat()
+
+        return {
+            "version": CACHE_VERSION,
+            "dataset_path": str(self.dataset_path.resolve()),
+            "size": stat.st_size,
+            "modified_ns": stat.st_mtime_ns,
+        }
+
+    def _load_cache(self) -> bool:
+        """Load a matching, previously saved index."""
+        if not self.cache_path.exists():
+            return False
+
+        try:
+            with self.cache_path.open("rb") as file:
+                cached = pickle.load(file)
+
+            if cached.get("signature") != self.dataset_signature:
+                return False
+
+            self.products = cached["products"]
+            self.tokenized_corpus = cached["tokenized_corpus"]
+            self.vocabulary = cached["vocabulary"]
+            self.bm25 = cached["bm25"]
+
+            return True
+
+        except Exception as error:
+            # A missing, outdated, or unreadable cache can be rebuilt.
+            print(f"BM25 cache unavailable; rebuilding: {error}")
+            return False
+
+    def _build_index(self) -> None:
+        """Read the catalog and construct the BM25 index."""
+        self.products = []
+
+        with self.dataset_path.open("r", encoding="utf-8") as file:
             for line_number, line in enumerate(file, start=1):
                 if not line.strip():
                     continue
@@ -42,7 +109,7 @@ class BM25SearchEngine:
                 except json.JSONDecodeError as error:
                     raise ValueError(
                         f"Invalid JSON on line {line_number} "
-                        f"of {dataset_path}"
+                        f"of {self.dataset_path}"
                     ) from error
 
                 searchable_text = str(
@@ -60,26 +127,49 @@ class BM25SearchEngine:
                 "The product catalog contains no searchable products."
             )
 
-        # Tokenize the catalog once when the engine starts.
         self.tokenized_corpus = [
             tokenize(product["searchable_text"])
             for product in self.products
         ]
 
-        # Vocabulary supports a quick check for completely unknown queries.
         self.vocabulary = {
             token
             for document in self.tokenized_corpus
             for token in document
         }
 
-        # Build the BM25 index once and reuse it for searches.
         self.bm25 = BM25Okapi(self.tokenized_corpus)
 
-        print(
-            f"BM25 indexed {len(self.products):,} products "
-            f"with {len(self.vocabulary):,} unique tokens."
-        )
+    def _save_cache(self) -> None:
+        """Persist the index for reuse after process restarts."""
+        self.cache_path.parent.mkdir(parents=True, exist_ok=True)
+
+        cached = {
+            "signature": self.dataset_signature,
+            "products": self.products,
+            "tokenized_corpus": self.tokenized_corpus,
+            "vocabulary": self.vocabulary,
+            "bm25": self.bm25,
+        }
+
+        temporary_path = self.cache_path.with_suffix(".pkl.tmp")
+
+        try:
+            with temporary_path.open("wb") as file:
+                pickle.dump(
+                    cached,
+                    file,
+                    protocol=pickle.HIGHEST_PROTOCOL,
+                )
+
+            temporary_path.replace(self.cache_path)
+
+        except OSError as error:
+            # Searching can still work if disk caching fails.
+            print(f"Could not save BM25 cache: {error}")
+
+            if temporary_path.exists():
+                temporary_path.unlink()
 
     @staticmethod
     def _matches_filter(product: dict, filters: dict) -> bool:
@@ -105,7 +195,9 @@ class BM25SearchEngine:
                     for value in (product.get("category_paths") or [])
                 ],
             ]
+
             category_query = str(category_filter).casefold()
+
             if not any(
                 category_query in value.casefold()
                 for value in category_values
@@ -121,27 +213,30 @@ class BM25SearchEngine:
         filters: dict | None = None,
     ) -> list[dict]:
         """Return positively scored products matching query and filters."""
-        if top_k < 1:
-            raise ValueError("top_k must be at least 1.")
+        if (
+            not isinstance(top_k, int)
+            or isinstance(top_k, bool)
+            or top_k < 1
+        ):
+            raise ValueError("top_k must be at least 1")
 
         query_tokens = tokenize(query or "")
+
         if not query_tokens:
             return []
 
         filters = filters or {}
 
-        # No known query terms means there cannot be a lexical match.
         if not any(token in self.vocabulary for token in query_tokens):
             return []
 
         scores = self.bm25.get_scores(query_tokens)
 
-        # Keep only positive-score products before ranking. This avoids
-        # filling results with products that have no positive lexical score.
-        # Use partial selection to avoid sorting the entire catalog.
-        import heapq
+        candidate_count = min(
+            len(scores),
+            max(top_k * 20, top_k),
+        )
 
-        candidate_count = min(len(scores), max(top_k * 20, top_k))
         candidate_indices = heapq.nlargest(
             candidate_count,
             range(len(scores)),
@@ -149,12 +244,15 @@ class BM25SearchEngine:
         )
 
         results = []
+
         for index in candidate_indices:
             score = float(scores[index])
+
             if score <= 0:
                 continue
 
             product = self.products[index]
+
             if not self._matches_filter(product, filters):
                 continue
 
