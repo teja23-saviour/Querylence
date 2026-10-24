@@ -1,9 +1,12 @@
 
+from __future__ import annotations
+
 import heapq
 import json
 import pickle
 import re
 from pathlib import Path
+from typing import Any
 
 from rank_bm25 import BM25Okapi
 
@@ -23,14 +26,24 @@ def tokenize(text: str) -> list[str]:
     return re.findall(r"[a-z0-9]+", text.lower())
 
 
+def _contains_phrase(text: str, phrase: str) -> bool:
+    """Match a phrase without matching it inside another word."""
+    return bool(
+        re.search(
+            rf"(?<!\w){re.escape(phrase.casefold())}(?!\w)",
+            text.casefold(),
+        )
+    )
+
+
 class BM25SearchEngine:
-    """Lexical product retrieval with a persistent BM25 index."""
+    """Lexical product retrieval with persistent index caching."""
 
     def __init__(
         self,
         dataset_path: Path = DATASET_PATH,
         cache_path: Path | None = None,
-    ):
+    ) -> None:
         self.dataset_path = Path(dataset_path)
 
         if not self.dataset_path.exists():
@@ -60,8 +73,8 @@ class BM25SearchEngine:
                 f"{len(self.vocabulary):,} unique tokens."
             )
 
-    def _get_dataset_signature(self) -> dict:
-        """Detect whether the source catalog has changed."""
+    def _get_dataset_signature(self) -> dict[str, Any]:
+        """Detect changes to the source catalog."""
         stat = self.dataset_path.stat()
 
         return {
@@ -72,7 +85,7 @@ class BM25SearchEngine:
         }
 
     def _load_cache(self) -> bool:
-        """Load a matching, previously saved index."""
+        """Load a matching local index cache."""
         if not self.cache_path.exists():
             return False
 
@@ -88,16 +101,18 @@ class BM25SearchEngine:
             self.vocabulary = cached["vocabulary"]
             self.bm25 = cached["bm25"]
 
-            return True
+            return (
+                bool(self.products)
+                and len(self.products) == len(self.tokenized_corpus)
+            )
 
         except Exception as error:
-            # A missing, outdated, or unreadable cache can be rebuilt.
             print(f"BM25 cache unavailable; rebuilding: {error}")
             return False
 
     def _build_index(self) -> None:
-        """Read the catalog and construct the BM25 index."""
-        self.products = []
+        """Read product records and build the lexical index."""
+        self.products: list[dict[str, Any]] = []
 
         with self.dataset_path.open("r", encoding="utf-8") as file:
             for line_number, line in enumerate(file, start=1):
@@ -111,6 +126,9 @@ class BM25SearchEngine:
                         f"Invalid JSON on line {line_number} "
                         f"of {self.dataset_path}"
                     ) from error
+
+                if not isinstance(product, dict):
+                    continue
 
                 searchable_text = str(
                     product.get("searchable_text") or ""
@@ -141,7 +159,7 @@ class BM25SearchEngine:
         self.bm25 = BM25Okapi(self.tokenized_corpus)
 
     def _save_cache(self) -> None:
-        """Persist the index for reuse after process restarts."""
+        """Persist the index for reuse."""
         self.cache_path.parent.mkdir(parents=True, exist_ok=True)
 
         cached = {
@@ -165,42 +183,67 @@ class BM25SearchEngine:
             temporary_path.replace(self.cache_path)
 
         except OSError as error:
-            # Searching can still work if disk caching fails.
             print(f"Could not save BM25 cache: {error}")
 
-            if temporary_path.exists():
-                temporary_path.unlink()
+            try:
+                if temporary_path.exists():
+                    temporary_path.unlink()
+            except OSError:
+                pass
 
     @staticmethod
-    def _matches_filter(product: dict, filters: dict) -> bool:
-        """Return True when a product satisfies all supported filters."""
-        brand_filter = filters.get("brand")
-        if brand_filter:
-            brand = str(product.get("brand") or "")
-            if str(brand_filter).casefold() not in brand.casefold():
-                return False
+    def _matches_filter(
+        product: dict[str, Any],
+        filters: dict[str, Any],
+    ) -> bool:
+        """Require explicitly supplied metadata constraints to match."""
+        for field in ("brand", "color", "material"):
+            expected = filters.get(field)
 
-        color_filter = filters.get("color")
-        if color_filter:
-            color = str(product.get("color") or "")
-            if str(color_filter).casefold() not in color.casefold():
-                return False
+            if expected is not None and str(expected).strip():
+                actual = str(product.get(field) or "")
+
+                if str(expected).casefold() not in actual.casefold():
+                    return False
 
         category_filter = filters.get("category")
-        if category_filter:
+
+        if category_filter is not None and str(category_filter).strip():
+            paths = product.get("category_paths") or []
+
+            if isinstance(paths, str):
+                paths = [paths]
+
             category_values = [
                 str(product.get("category") or ""),
-                *[
-                    str(value)
-                    for value in (product.get("category_paths") or [])
-                ],
+                *(str(value) for value in paths),
             ]
 
-            category_query = str(category_filter).casefold()
-
             if not any(
-                category_query in value.casefold()
+                str(category_filter).casefold() in value.casefold()
                 for value in category_values
+            ):
+                return False
+
+        product_type = filters.get("product_type")
+
+        if product_type is not None and str(product_type).strip():
+            paths = product.get("category_paths") or []
+
+            if isinstance(paths, str):
+                paths = [paths]
+
+            searchable_metadata = " ".join(
+                (
+                    str(product.get("title") or ""),
+                    str(product.get("category") or ""),
+                    *(str(value) for value in paths),
+                )
+            )
+
+            if not _contains_phrase(
+                searchable_metadata,
+                str(product_type),
             ):
                 return False
 
@@ -210,17 +253,20 @@ class BM25SearchEngine:
         self,
         query: str,
         top_k: int = 10,
-        filters: dict | None = None,
-    ) -> list[dict]:
-        """Return positively scored products matching query and filters."""
+        filters: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return the highest-scoring lexical matches."""
         if (
-            not isinstance(top_k, int)
-            or isinstance(top_k, bool)
+            isinstance(top_k, bool)
+            or not isinstance(top_k, int)
             or top_k < 1
         ):
             raise ValueError("top_k must be at least 1")
 
-        query_tokens = tokenize(query or "")
+        if not isinstance(query, str) or not query.strip():
+            return []
+
+        query_tokens = tokenize(query)
 
         if not query_tokens:
             return []
@@ -230,6 +276,7 @@ class BM25SearchEngine:
         if not any(token in self.vocabulary for token in query_tokens):
             return []
 
+        # Restore the original BM25 scoring and candidate selection.
         scores = self.bm25.get_scores(query_tokens)
 
         candidate_count = min(
@@ -243,7 +290,7 @@ class BM25SearchEngine:
             key=lambda index: scores[index],
         )
 
-        results = []
+        results: list[dict[str, Any]] = []
 
         for index in candidate_indices:
             score = float(scores[index])
@@ -256,21 +303,13 @@ class BM25SearchEngine:
             if not self._matches_filter(product, filters):
                 continue
 
-            results.append(
-                {
-                    "product_id": product.get("product_id"),
-                    "title": product.get("title"),
-                    "description": product.get("description"),
-                    "brand": product.get("brand"),
-                    "category": product.get("category"),
-                    "color": product.get("color"),
-                    "main_image_id": product.get("main_image_id"),
-                    "marketplace": product.get("marketplace"),
-                    "domain_name": product.get("domain_name"),
-                    "score": round(score, 4),
-                    "retrieval_method": "bm25",
-                }
-            )
+            # Preserve every original metadata field for reranking.
+            result = dict(product)
+            result["score"] = round(score, 4)
+            result["bm25_score"] = round(score, 4)
+            result["retrieval_method"] = "bm25"
+
+            results.append(result)
 
             if len(results) >= top_k:
                 break

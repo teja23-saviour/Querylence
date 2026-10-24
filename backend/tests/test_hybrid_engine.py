@@ -1,7 +1,13 @@
-
 import pytest
 
 from retrieval.hybrid_engine import HybridSearchEngine
+
+
+@pytest.fixture(autouse=True)
+def disable_optional_features(monkeypatch):
+    """Keep baseline tests independent of inherited shell settings."""
+    monkeypatch.setenv("QUERYLENCE_RERANKING", "false")
+    monkeypatch.setenv("QUERYLENCE_RECOVERY", "false")
 
 
 class FakeEngine:
@@ -39,9 +45,13 @@ def test_fuses_results_from_both_engines():
 
     ids = [item["product_id"] for item in results]
 
+    # B is ranked first because it appears in both retrieval engines.
     assert ids[0] == "B"
     assert set(ids) == {"A", "B", "C"}
-    assert all(item["retrieval_method"] == "hybrid" for item in results)
+    assert all(
+        item["retrieval_method"] == "hybrid"
+        for item in results
+    )
 
 
 def test_product_found_by_both_engines_gets_fused_score():
@@ -55,6 +65,7 @@ def test_product_found_by_both_engines_gets_fused_score():
 
     assert len(results) == 1
     assert results[0]["score"] == pytest.approx(expected)
+    assert results[0]["rrf_score"] == pytest.approx(expected)
 
 
 def test_passes_filters_to_both_engines():
@@ -67,6 +78,17 @@ def test_passes_filters_to_both_engines():
 
     assert bm25.last_filters == filters
     assert semantic.last_filters == filters
+
+
+def test_passes_query_to_both_engines():
+    bm25 = FakeEngine([])
+    semantic = FakeEngine([])
+
+    engine = HybridSearchEngine(bm25, semantic)
+    engine.search("comfortable running shoes")
+
+    assert bm25.last_query == "comfortable running shoes"
+    assert semantic.last_query == "comfortable running shoes"
 
 
 def test_empty_query_returns_no_results():
@@ -97,3 +119,23 @@ def test_respects_top_k():
     results = engine.search("clothing", top_k=2)
 
     assert len(results) == 2
+
+
+def test_rrf_score_is_not_the_input_engine_score():
+    bm25 = FakeEngine([product("A", "Blue shoes")])
+    semantic = FakeEngine([product("A", "Blue shoes")])
+
+    results = HybridSearchEngine(bm25, semantic).search("blue shoes")
+
+    assert results[0]["score"] == pytest.approx(2 / 61)
+    assert results[0]["score"] != 0.9
+
+
+def test_result_contains_rrf_components():
+    bm25 = FakeEngine([product("A", "Blue shoes")])
+    semantic = FakeEngine([product("A", "Blue shoes")])
+
+    results = HybridSearchEngine(bm25, semantic).search("blue shoes")
+
+    assert results[0]["rrf_components"]["bm25"]["rank"] == 1
+    assert results[0]["rrf_components"]["semantic"]["rank"] == 1

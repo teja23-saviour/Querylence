@@ -4,6 +4,8 @@ from pydantic import BaseModel, Field, model_validator
 
 class ProductFilters(BaseModel):
     color: str | None = None
+    material: str | None = None
+    product_type: str | None = None
     category: str | None = None
     brand: str | None = None
 
@@ -20,6 +22,7 @@ class ProductFilters(BaseModel):
             raise ValueError(
                 "min_price cannot exceed max_price"
             )
+
         return self
 
 
